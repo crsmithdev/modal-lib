@@ -1,0 +1,12 @@
+{
+  "app": "mlib-example",
+  "image": "image.py:image",
+  "recipes": {
+    "smoke": {"kind": "job", "gpu": "L4", "timeout": 300, "cmd": ["python", "train.py"],
+              "env": {"STEPS": "20"}, "phases": {"load": "^loading", "train": "^step 1/"}},
+    "fail": {"kind": "job", "gpu": "L4", "timeout": 300, "cmd": ["python", "train.py"],
+             "env": {"STEPS": "5", "FAIL": "1"}, "phases": {"load": "^loading", "train": "^step 1/"}},
+    "web": {"kind": "serve", "gpu": "L4", "port": 8000, "idle": 60,
+            "cmd": ["python", "-m", "http.server", "8000"], "ready": "/"}
+  }
+}
