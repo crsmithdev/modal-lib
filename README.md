@@ -1,92 +1,138 @@
-# modal-clock
+# modal-lib
 
-Run functions on [Modal](https://modal.com) GPUs and record the wall-clock
-time of each phase, from the call to the result. It also keeps a
-`torch.compile` cache on a Modal Volume per GPU type, and prices each call.
+Run training jobs on [Modal](https://modal.com) GPUs from a catalog of
+recipes, and record the wall-clock time and cost of each phase.
 
-A benchmark usually times only the loop it cares about. A cloud GPU call also
-spends time waiting for a container, importing torch, starting CUDA and
-compiling, and Modal bills from container start. This module records all of
-it.
+- **Recipes:** one JSON file of named job settings, with `--set` overrides
+  on the command line.
+- **Runs:** each call gets an ID, a folder on a Modal Volume, and a record
+  of when each phase started and what it cost. Runs outlive the terminal, and
+  `mlib runs` and `mlib pull` find them later.
+- **Clock:** the time from the call to the container start, through setup
+  and compile, to the result. Modal bills from container start, so the
+  record also prices each run.
+- **Compile cache:** a `torch.compile` cache on a Volume per GPU type, as
+  one tar file.
 
-## Use
+## Install
 
 ```sh
-uv add "modal-clock @ git+https://github.com/crsmithdev/modal-clock"
+uv add "modal-lib @ git+https://github.com/crsmithdev/modal-lib"
+uv run modal setup   # once
 ```
 
-Import `modal_clock` first in the app file. The container imports the app
-file when it starts, so the import time is the container start.
+## A job
+
+A job is a Modal function that takes `(recipe, run_id)`. Import `modal_lib`
+first in the app file: the container imports the app file when it starts, so
+the import time is the container start.
 
 ```python
-import modal_clock as mc
-
-import contextlib
-import pathlib
+import modal_lib as ml
 
 import modal
 
-APP = "my-bench"
-app = modal.App(APP, image=mc.torch_image(packages=["numpy"]))
+APP = "my-jobs"
+app = modal.App(APP, image=ml.torch_image(packages=["numpy"]).add_local_dir("src", "/root/src"))
 
 
 @app.function(timeout=3600, single_use_containers=True)
-def bench(gpu: str, cached: bool, fill: bool = False) -> dict:
-    clock = mc.Clock()
-    clock.mark("enter")
-    cache = mc.compile_cache(fill=mc.cache_volume(APP, gpu) if fill else None)
-    with cache if cached else contextlib.nullcontext():
-        clock.mark("copy")
-        import torch                # after the cache: Inductor reads its paths at import
-        clock.mark("torch")
-        ...                         # compile and warm up
-        clock.mark("warm")
-        ...                         # the timed work
-        return clock.done(acc=0.94)  # extra fields go into the record
-
-
-@app.local_entrypoint()
-def main(gpu: str = "H100"):
-    fn = bench.with_options(gpu=gpu, volumes={mc.CACHE_MOUNT: mc.cache_volume(APP, gpu)})
-    calls = [(dict(gpu=gpu, cached=True), lambda: fn.remote(gpu, True))]
-    for row in mc.run(calls, pathlib.Path("results/bench.jsonl")):
-        print(row)
+def train(recipe: dict, run_id: str) -> dict:
+    with ml.Run(APP, run_id, recipe) as run:
+        import torch
+        run.clock.mark("torch")
+        ...                                   # set up
+        run.clock.mark("compile")
+        ...                                   # train, and save files in run.dir
+        run.result = {"loss": 0.1}
+    return run.record
 ```
 
-[`examples/matmul.py`](examples/matmul.py) is a complete app that fills the
-cache and times a cold call and a warm call:
+`single_use_containers=True` gives each run a fresh container. A reused
+container started before the run's call, so its record has `reused: true`
+and no cold start.
+
+Recipes go in one JSON file:
+
+```json
+{
+  "default": "smoke",
+  "recipes": {
+    "smoke": {"gpu": "L4", "steps": 500, "lr": 0.001, "note": "a minute on an L4"},
+    "full": {"gpu": "H100:8", "steps": 20000, "lr": 0.0003, "timeout": 21600}
+  }
+}
+```
+
+The job gets the whole recipe. modal-lib reads four keys: `gpu` (a Modal
+GPU spec), `timeout` (seconds, default 3600), `env` (environment variables
+for the container) and `function` (a job other than the default).
+
+Point `mlib` at the app in `pyproject.toml`:
+
+```toml
+[tool.modal-lib]
+app = "my-jobs"
+file = "jobs.py"
+function = "train"
+recipes = "recipes.json"
+```
+
+## Commands
 
 ```sh
-uv run modal run examples/matmul.py --gpus L4,H100
+mlib recipes                      # the catalog; * is the default
+mlib show full --set steps=100    # one recipe after overrides
+mlib deploy                       # deploy the app; runs need a deployed app
+mlib run smoke                    # spawn a run and print its ID
+mlib run full --set lr=1e-4 --set env.SEED=3 --wait
+mlib runs                         # every run: status, time to start, run time, dollars
+mlib pull smoke-20261022-095704   # download the run's folder to runs/<id>/
 ```
 
-## What it records
+`mlib run` appends each run to `.modal-lib/runs.jsonl` in the project. A
+`--set` value is JSON if it parses, and a string if not.
 
-Each call writes one JSON row:
+`mlib runs` output:
 
-| Field | Set by | Time |
-| - | - | - |
-| `t_call` | `run`, local | before the call |
-| `t_start` | the import, in the container | container start |
-| `t_<name>` | `Clock.mark(name)` | wherever the function marks it |
-| `t_end` | `Clock.done()` | the end of the function |
-| `gpu_name` | `Clock.done()` | the device from `nvidia-smi` |
-| `error` | `run` | if the call raised |
+```
+smoke-20261022-095704                L4         done       start   6.0 s  run     7.9 s  $0.002
+smoke-20261022-095734                T4         done       start   3.9 s  run    24.0 s  $0.004
+smoke-20261022-100021                L4         failed     start   8.5 s  run     4.8 s  $0.001
+```
 
-The row also has the fields that you give to `run` and to `Clock.done()`. All
-times are Unix seconds from `time.time()`, so durations between the local
-side and the container depend on the clocks agreeing.
+## The run folder
 
-- `t_start - t_call` is the cold start. Modal does not bill it.
-- `t_end - t_start` is the billed time. `mc.cost(seconds, gpu)` prices it at
-  `mc.PRICE`, Modal's GPU prices on 2026-10-21. CPU and memory are left out.
+`/runs/<id>/` on the Volume `<app>-runs` holds:
 
-## Compile cache
+- `recipe.json`: the recipe after overrides.
+- `record.json`: `t_start`, a `t_<name>` for each `run.clock.mark(name)`,
+  `t_end`, `gpu_name` (the device from `nvidia-smi`), `result`, and `error`
+  if the job raised.
+- the files that the job wrote to `run.dir`.
+
+All times are Unix seconds from `time.time()`. `t_start` minus the local
+`t_call` is the cold start, which Modal does not bill. `t_end` minus
+`t_start` is the billed time, priced at `ml.PRICE`, Modal's GPU prices on
+2026-10-21, times the GPU count. CPU and memory are left out.
+
+## Benchmarks across GPUs
+
+For a benchmark that makes many calls and compares them, use the pieces
+directly. `ml.Clock` records the marks, `ml.measure` makes the calls
+concurrently and writes one JSON row per call with `t_call`, and
+`ml.compile_cache` keeps the compile cache.
+[`examples/clock_matmul.py`](examples/clock_matmul.py) times a cold call and
+a warm call:
+
+```sh
+uv run modal run examples/clock_matmul.py --gpus L4,H100
+```
 
 `compile_cache()` points `TORCHINDUCTOR_CACHE_DIR` and `TRITON_CACHE_DIR` at
 `/tmp/cache` and unpacks `/cache/cache.tar` there if the Volume has it. Enter
 it before `import torch`. With `fill=<volume>`, the exit packs the cache and
-commits it to the Volume.
+commits it.
 
 The cache is one tar file because a Modal Volume reads about 0.4 s per file,
 and an Inductor cache can have thousands of files. In one case, 5,165 files
@@ -95,7 +141,19 @@ took 33 minutes to read one by one and 1 to 5 s to unpack as one tar.
 `cache_volume(app, gpu)` keys the Volume by the GPU type that you ask for.
 Modal sometimes gives a different variant of that type (an A100 80GB for an
 A100 40GB, an A10G for an A10), and the cache misses on a different device.
-Record `gpu_name` and group the results by it.
+Group results by `gpu_name`.
+
+## The examples in this repo
+
+This repo's `pyproject.toml` points `mlib` at
+[`examples/jobs.py`](examples/jobs.py), a small MLP job, and
+[`examples/recipes.json`](examples/recipes.json):
+
+```sh
+uv sync
+uv run mlib deploy
+uv run mlib run smoke --wait
+```
 
 ## Used by
 
