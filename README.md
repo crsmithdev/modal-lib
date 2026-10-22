@@ -47,8 +47,8 @@ def bench(gpu: str, cached: bool, fill: bool = False) -> dict:
 
 @app.local_entrypoint()
 def main(gpu: str = "H100"):
-    volumes = {mc.CACHE_MOUNT: mc.cache_volume(APP, gpu)}
-    calls = [(dict(gpu=gpu, cached=False), lambda: bench.with_options(gpu=gpu).remote(gpu, False))]
+    fn = bench.with_options(gpu=gpu, volumes={mc.CACHE_MOUNT: mc.cache_volume(APP, gpu)})
+    calls = [(dict(gpu=gpu, cached=True), lambda: fn.remote(gpu, True))]
     for row in mc.run(calls, pathlib.Path("results/bench.jsonl")):
         print(row)
 ```
