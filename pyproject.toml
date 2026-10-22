@@ -1,0 +1,10 @@
+[project]
+name = "modal-clock"
+version = "0.1.0"
+description = "Run functions on Modal GPUs and record the wall-clock time of each phase"
+requires-python = ">=3.12"
+dependencies = ["modal>=1.6.2"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
