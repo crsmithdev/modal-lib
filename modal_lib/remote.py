@@ -28,11 +28,20 @@ class Run:
         os.makedirs(self.dir, exist_ok=True)
         self.lock = threading.Lock()
         self.done = threading.Event()
+        # A retry runs in a new container with the same call ID, so the run
+        # folder already has the record of each earlier attempt.
+        attempts = []
+        if os.path.exists(f"{self.dir}/record.json"):
+            with open(f"{self.dir}/record.json") as f:
+                old = json.load(f)
+            attempts = old.pop("attempts", []) + [dict(old, status="lost" if old["status"] == "running" else old["status"])]
         self.record = dict(id=run_id, app=app, kind=kind, name=name, recipe=r, t_call=t_call,
-                           t_container=now - uptime, t_enter=now, phases={}, status="running")
+                           t_container=now - uptime, t_enter=now, phases={}, status="running",
+                           attempt=len(attempts), attempts=attempts)
         self.gpu()
-        self.event("call", t=t_call)
-        self.event("container", t=self.record["t_container"])
+        if not attempts:
+            self.event("call", t=t_call)
+        self.event("container", t=self.record["t_container"], attempt=len(attempts))
 
     def gpu(self) -> None:
         """Record the GPU type and count that the container actually has."""
@@ -60,6 +69,8 @@ class Run:
             rec.update(status=status, t_beat=now, seconds=now - rec["t_container"])
             price = PRICE.get(rec.get("gpu_type"))
             rec["cost"] = rec["seconds"] * price * rec["gpu_count"] if price else None
+            if rec["cost"] is not None:
+                rec["cost"] += sum(a.get("cost") or 0 for a in rec["attempts"])
             rec["durations"] = durations(rec)
             with open(f"{self.dir}/record.json", "w") as f:
                 json.dump(rec, f, indent=2)
@@ -73,7 +84,8 @@ class Run:
 
     def start(self) -> subprocess.Popen:
         """Start the command, the GPU sampler and the heartbeat."""
-        env = dict(os.environ, PYTHONUNBUFFERED="1", **self.r.get("env", {}))
+        env = dict(os.environ, PYTHONUNBUFFERED="1", MLIB_RUN_DIR=self.dir,
+                   MLIB_ATTEMPT=str(self.record["attempt"]), **self.r.get("env", {}))
         if self.r.get("cache"):
             env.update(self.cache_in())
         if shutil.which("nvidia-smi"):
@@ -150,9 +162,12 @@ def durations(rec: dict) -> dict:
     """Seconds from the call to the container, to the command, and in each phase.
 
     A phase starts at the first line that matches its pattern, and ends at
-    the start of the next phase or at the exit.
+    the start of the next phase or at the exit. After a retry, `restart` is
+    the time from the last heartbeat of the earlier attempt to this container.
     """
     d = dict(start=rec["t_container"] - rec["t_call"])
+    if rec.get("attempts"):
+        d["restart"] = rec["t_container"] - rec["attempts"][-1]["t_beat"]
     if "t_cmd" not in rec:
         return d
     d["setup"] = rec["t_cmd"] - rec["t_container"]

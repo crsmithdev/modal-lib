@@ -41,7 +41,7 @@ def cmd_run(args) -> None:
 
     app = modal.App(f"{app_name}-{name}")
     fn = app.function(name="job", timeout=r.get("timeout", 3600), single_use_containers=True,
-                      **function(p, name, r))(job)
+                      retries=r.get("retries", 0), **function(p, name, r))(job)
     with modal.enable_output(), app.run(detach=True):
         call = fn.spawn()
     print(call.object_id)

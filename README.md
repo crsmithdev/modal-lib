@@ -43,7 +43,10 @@ Put `modal.json` in the project root and run `mlib` there:
   serialized. Set the working directory of the command with `.workdir()`.
 - `volumes` and `secrets` are names. Every recipe gets them.
 - A recipe has `cmd` and `gpu`, and optionally `env` (strings), `timeout`
-  in seconds, `phases` and `cache`.
+  in seconds, `retries`, `phases` and `cache`.
+- `retries` is the count of times that Modal starts a job again in a new
+  container when its container stops, for example on a lost machine. A
+  command that exits with a code that is not 0 is not retried.
 - `phases` maps a phase name to a regular expression. A phase starts at
   the first output line that matches, and ends at the next phase or the exit.
 - `cache: true` keeps the `torch.compile` cache on the Volume `<app>-cache`,
@@ -84,6 +87,15 @@ and the deploy time. The folder is `/<id>/` on the Volume `<app>-runs`:
 The durations are `start` (call to container start), `setup` (container
 start to command start), each phase, and `cmd` (command start to exit).
 
+A retry writes to the same folder. The log and the events continue, and
+`record.json` keeps each earlier attempt under `attempts`, with the status
+`lost` if its container stopped. `restart` is the time from the last
+heartbeat of the earlier attempt to the new container, and the cost is the
+sum of all the attempts. The command gets `MLIB_RUN_DIR`, its run folder,
+and `MLIB_ATTEMPT`, 0 for the first attempt. Files that the command writes
+to the run folder are on the Volume at the next heartbeat, so a new
+attempt can read a checkpoint that the earlier one wrote.
+
 The status is `running`, `ok`, `failed` (an exit code that is not 0, which
 includes a job that times out or that `mlib stop` cancels), or `lost` (no
 heartbeat for 90 s: the container stopped before it could record the exit).
@@ -101,6 +113,7 @@ out. The cost is empty for a GPU that is not in the price table.
 cd examples
 uv run mlib run smoke --wait   # 20 one-second steps on an L4, about $0.006
 uv run mlib run fail --wait    # exits 3
+uv run mlib run lost           # stops its container at step 35; Modal retries it once
 uv run mlib serve web          # python -m http.server on an L4
 ```
 
